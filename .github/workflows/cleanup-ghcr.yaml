@@ -1,0 +1,221 @@
+name: Cleanup GHCR Images
+
+on:
+  schedule:
+    - cron: '35 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Skip deletions and only report candidates
+        required: false
+        default: true
+        type: boolean
+      keep_recent_sha:
+        description: Override number of recent sha-* tags to keep
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  OWNER: sjun168
+  PACKAGE_NAME: sub2api
+  GITOPS_REPO: sjun168/aiclaw-gitops
+  GITOPS_REF: main
+  GITOPS_FILE: apps/sub2api/deployment.yaml
+  KEEP_RECENT_SHA: '20'
+  KEEP_ALWAYS_TAGS: latest,main,dev
+  DELETE_UNTAGGED_AFTER_DAYS: '3'
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune old package versions
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          EVENT_PATH: ${{ github.event_path }}
+          STEP_SUMMARY: ${{ github.step_summary }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from datetime import datetime, timedelta, timezone
+
+          if not os.environ.get('GH_TOKEN'):
+              raise SystemExit('GHCR_TOKEN secret is required for package cleanup')
+
+          def gh_api(path, method='GET'):
+              cmd = ['gh', 'api']
+              if method != 'GET':
+                  cmd.extend(['-X', method])
+              cmd.extend([path, '-H', 'Accept: application/vnd.github+json'])
+              return subprocess.check_output(cmd, text=True)
+
+          def gh_json(path):
+              return json.loads(gh_api(path))
+
+          with open(os.environ['EVENT_PATH'], 'r', encoding='utf-8') as fh:
+              event = json.load(fh)
+
+          inputs = event.get('inputs') or {}
+          dry_run = str(inputs.get('dry_run', 'false')).lower() == 'true'
+          keep_recent_sha = int(inputs.get('keep_recent_sha') or os.environ['KEEP_RECENT_SHA'])
+          delete_untagged_after_days = int(os.environ['DELETE_UNTAGGED_AFTER_DAYS'])
+
+          owner = os.environ['OWNER']
+          package_name = os.environ['PACKAGE_NAME']
+          gitops_repo = os.environ['GITOPS_REPO']
+          gitops_ref = os.environ['GITOPS_REF']
+          gitops_file = os.environ['GITOPS_FILE']
+          always_tags = {
+              tag.strip() for tag in os.environ['KEEP_ALWAYS_TAGS'].split(',') if tag.strip()
+          }
+
+          gitops_blob = gh_json(f'/repos/{gitops_repo}/contents/{gitops_file}?ref={gitops_ref}')
+          gitops_content = base64.b64decode(gitops_blob['content']).decode('utf-8')
+          image_match = re.search(r'^\s*image:\s*(\S+)\s*$', gitops_content, re.M)
+          current_tag = None
+          if image_match:
+              image_ref = image_match.group(1).split('@', 1)[0]
+              image_name = image_ref.rsplit('/', 1)[-1]
+              if ':' in image_name:
+                  current_tag = image_name.rsplit(':', 1)[1]
+
+          protected_tags = set(always_tags)
+          if current_tag:
+              protected_tags.add(current_tag)
+
+          versions = []
+          page = 1
+          while True:
+              batch = gh_json(
+                  f'/users/{owner}/packages/container/{package_name}/versions?per_page=100&page={page}'
+              )
+              if not batch:
+                  break
+              versions.extend(batch)
+              page += 1
+
+          versions.sort(key=lambda item: item['created_at'], reverse=True)
+
+          keep_recent_sha_ids = set()
+          kept_sha = 0
+          for version in versions:
+              tags = version.get('metadata', {}).get('container', {}).get('tags') or []
+              if any(tag.startswith('sha-') for tag in tags) and kept_sha < keep_recent_sha:
+                  keep_recent_sha_ids.add(version['id'])
+                  kept_sha += 1
+
+          cutoff = datetime.now(timezone.utc) - timedelta(days=delete_untagged_after_days)
+          kept = []
+          candidates = []
+
+          for version in versions:
+              tags = version.get('metadata', {}).get('container', {}).get('tags') or []
+              created_at = datetime.fromisoformat(version['created_at'].replace('Z', '+00:00'))
+              reasons = []
+
+              matching_protected = sorted(tag for tag in tags if tag in protected_tags)
+              if matching_protected:
+                  reasons.append('protected tags: ' + ', '.join(matching_protected))
+              if version['id'] in keep_recent_sha_ids:
+                  reasons.append('recent sha window')
+              if not tags and created_at >= cutoff:
+                  reasons.append('recent untagged version')
+
+              record = {
+                  'id': version['id'],
+                  'created_at': version['created_at'],
+                  'tags': tags,
+              }
+              if reasons:
+                  record['reasons'] = reasons
+                  kept.append(record)
+              else:
+                  candidates.append(record)
+
+          deleted = []
+          failures = []
+          if not dry_run:
+              for version in candidates:
+                  try:
+                      gh_api(
+                          f'/users/{owner}/packages/container/{package_name}/versions/{version["id"]}',
+                          method='DELETE',
+                      )
+                      deleted.append(version)
+                  except subprocess.CalledProcessError as exc:
+                      failures.append(
+                          {
+                              'id': version['id'],
+                              'tags': version['tags'],
+                              'error': exc.stderr or exc.stdout or str(exc),
+                          }
+                      )
+
+          print(json.dumps(
+              {
+                  'package': package_name,
+                  'dry_run': dry_run,
+                  'protected_tags': sorted(protected_tags),
+                  'keep_recent_sha': keep_recent_sha,
+                  'kept_count': len(kept),
+                  'candidate_count': len(candidates),
+                  'deleted_count': len(deleted),
+                  'failure_count': len(failures),
+              },
+              indent=2,
+          ))
+
+          summary_lines = [
+              f'# GHCR cleanup for `{package_name}`',
+              '',
+              f'- Dry run: `{str(dry_run).lower()}`',
+              f'- Protected tags: `{", ".join(sorted(protected_tags))}`',
+              f'- Recent sha versions kept: `{keep_recent_sha}`',
+              f'- Versions kept: `{len(kept)}`',
+              f'- Deletion candidates: `{len(candidates)}`',
+              f'- Deleted: `{len(deleted)}`',
+              f'- Delete failures: `{len(failures)}`',
+              '',
+              '## Current GitOps image',
+              '',
+              f'- `{image_match.group(1) if image_match else "not found"}`',
+              '',
+              '## Candidate versions',
+              '',
+          ]
+
+          if candidates:
+              for version in candidates[:50]:
+                  tags = ', '.join(version['tags']) if version['tags'] else '(untagged)'
+                  summary_lines.append(
+                      f'- id `{version["id"]}` | tags `{tags}` | created `{version["created_at"]}`'
+                  )
+              if len(candidates) > 50:
+                  summary_lines.append(f'- ... and `{len(candidates) - 50}` more')
+          else:
+              summary_lines.append('- none')
+
+          if failures:
+              summary_lines.extend(['', '## Delete failures', ''])
+              for failure in failures:
+                  tags = ', '.join(failure['tags']) if failure['tags'] else '(untagged)'
+                  summary_lines.append(
+                      f'- id `{failure["id"]}` | tags `{tags}` | error `{failure["error"].strip()}`'
+                  )
+
+          with open(os.environ['STEP_SUMMARY'], 'w', encoding='utf-8') as fh:
+              fh.write('\n'.join(summary_lines) + '\n')
+
+          if failures:
+              raise SystemExit(1)
+          PY
