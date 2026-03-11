@@ -1,0 +1,118 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    branches: ['main']
+  workflow_dispatch:
+
+concurrency:
+  group: sub2api-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: sjun168/sub2api
+  GITOPS_REPO: git@github.com:sjun168/aiclaw-gitops.git
+  GITOPS_BRANCH: main
+  GITOPS_FILE: apps/sub2api/deployment.yaml
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set build date
+        id: build-date
+        run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=sha-${{ github.sha }}
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            VERSION=sha-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ steps.build-date.outputs.value }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Update GitOps deployment image
+        env:
+          GITOPS_SSH_KEY: ${{ secrets.GITOPS_SSH_KEY }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+        run: |
+          if [ -z "$GITOPS_SSH_KEY" ]; then
+            echo "Missing GITOPS_SSH_KEY secret" >&2
+            exit 1
+          fi
+
+          eval "$(ssh-agent -s)"
+          trap 'ssh-agent -k' EXIT
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$GITOPS_SSH_KEY" > ~/.ssh/gitops_key
+          chmod 600 ~/.ssh/gitops_key
+          ssh-add ~/.ssh/gitops_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          git clone --depth 1 --branch "$GITOPS_BRANCH" "$GITOPS_REPO" /tmp/gitops
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path('/tmp/gitops') / os.environ['GITOPS_FILE']
+          text = path.read_text()
+          updated, count = re.subn(r'(^\s*image:\s*).+$', r'\1' + os.environ['IMAGE_REF'], text, count=1, flags=re.M)
+          if count != 1:
+              raise SystemExit(f'Expected one image line in {path}')
+          path.write_text(updated)
+          PY
+
+          cd /tmp/gitops
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$GITOPS_FILE"
+          if git diff --cached --quiet; then
+            echo "GitOps repo already references $IMAGE_REF"
+            exit 0
+          fi
+
+          git commit -m "deploy: update sub2api image to sha-${{ github.sha }}"
+
+          for attempt in 1 2 3; do
+            git pull --rebase origin "$GITOPS_BRANCH"
+            if git push origin HEAD:"$GITOPS_BRANCH"; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Failed to push GitOps update after retries" >&2
+          exit 1
