@@ -37,8 +37,6 @@ jobs:
       - name: Prune old package versions
         env:
           GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
-          EVENT_PATH: ${{ github.event_path }}
-          STEP_SUMMARY: ${{ github.step_summary }}
         run: |
           python3 - <<'PY'
           import base64
@@ -62,7 +60,7 @@ jobs:
           def gh_json(path):
               return json.loads(gh_api(path))
 
-          with open(os.environ['EVENT_PATH'], 'r', encoding='utf-8') as fh:
+          with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as fh:
               event = json.load(fh)
 
           inputs = event.get('inputs') or {}
@@ -213,7 +211,7 @@ jobs:
                       f'- id `{failure["id"]}` | tags `{tags}` | error `{failure["error"].strip()}`'
                   )
 
-          with open(os.environ['STEP_SUMMARY'], 'w', encoding='utf-8') as fh:
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'w', encoding='utf-8') as fh:
               fh.write('\n'.join(summary_lines) + '\n')
 
           if failures:
